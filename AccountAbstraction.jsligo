@@ -1,0 +1,257 @@
+/****************
+ * Helper Types *
+ ****************/
+
+// a Proof of Event is the message signatures for all signing parties
+type Event = {
+  event_id : string,
+  message : bytes,
+  signatures : list<[address, key_hash, signature]>
+};
+
+// The smart contract stores events that are awaiting signatures
+// when all signatures are collected we will emit the event
+type PendingEvent = { 
+  message : bytes,
+  awaiting_signature : map<address, key_hash>,
+  already_signed : list<[address, key_hash, signature]>
+};
+
+// in addition to the pending events we store the owner of the contract and 
+// the contracts that will be required to sign each new event
+type Storage = {
+  owner_address : address,
+  pending_events : map<string, PendingEvent>,
+  signers : map<address,key_hash>
+};
+
+// we use a dummy type to represent that the contract caller is the owner of the contract
+// this should only ever be created by the abort_if_not_owner function below
+type OwnerAuthorisation = 
+| ["ImTheOwner"];
+
+type EntryPointReturnType = [list <operation>, Storage];
+
+/********************
+ * Entrypoint Types *
+ ********************/
+
+// We request an event with a unique identifer
+// and a message to be signed, this is forwarded to the signers when an event is created.
+type EventRequest = {
+  event_id : string, 
+  message : bytes
+};
+
+// The owner can propose a new signer. To confirm the signer must send their public
+// signing key and sign a message to confirm they have the private key
+type ProposeSigner = {
+  signing_address : address,
+  authorisation_message : bytes,
+  signing_key_hash : key_hash
+};
+
+// This is the entry point required by the signing contracts
+// in reality they would be more complex
+type CallbackParameter = 
+| ["RequestSignature", EventRequest]
+| ["RequestConfirmation", ticket<ProposeSigner>]
+
+
+type SignEvent = {
+  event_id : string,
+  signing_key : key,
+  signature : signature
+};
+
+type ConfirmSigner = {
+  authorisation_ticket : ticket<ProposeSigner>,
+  signing_key : key,
+  signed_authorisation : signature,
+};
+
+type EntrypointParameter =
+// the owner of the contract is allowed to propose new signers
+| ["ProposeSigner", ProposeSigner]
+
+// signers must confirm by signing a message and returning an authorisation ticket
+| ["ConfirmSigner", ConfirmSigner]
+
+// signers are allowed to remove themselves.
+| ["RemoveSigner"]
+
+// the owner may pass ownership of the contract to a new address
+| ["ChangeOwner", address]
+
+// the owner may also create an event, this will inform all 
+// signers of the new event and await their signatures
+| ["ProposeEvent", EventRequest]
+
+// the signers must each sign the event message, only then will it be emitted.
+| ["SignEvent", SignEvent]
+
+// If for some reason an event is not signed the owner can remove it from storage
+| ["AbandonEvent", string];
+
+
+/********************
+ * Helper Functions *
+ ********************/
+
+const no_op = (storage : Storage) : EntryPointReturnType => [list([]), storage]
+
+const abort_if_not_owner = (storage : Storage) : OwnerAuthorisation => {
+  if (storage.owner_address != Tezos.get_sender()) {
+    failwith("only the owner can perform this action");
+  }
+  return ImTheOwner();
+};
+
+// updates the events in storage with a new or recently signed event
+// if all the signatures are present the event is emmitted.
+const emit_or_update = (storage, id : string, event : PendingEvent) : EntryPointReturnType => {
+  if (Map.size(event.awaiting_signature) == (0 as nat)) {
+    const emit_event : Event = {
+        event_id : id,
+        message : event.message,
+        signatures : event.already_signed
+    };
+    const updated_storage : Storage = { ...storage,
+      pending_events : Map.remove(id, storage.pending_events)
+    };
+    return [list([ Tezos.emit("%proof_of_event", emit_event)]), updated_storage]
+  } else {
+    const updated_storage : Storage = { ...storage,
+      pending_events : Map.add(id, event, storage.pending_events)
+    };
+    return no_op(updated_storage);
+  }
+};
+
+const find_event = (storage : Storage, id : string) : PendingEvent => 
+  match(Map.find_opt(id, storage.pending_events), {
+    Some: event => event,
+    None: () => failwith ("no event " + id)
+  });
+
+// validates a signature and updates a pending event
+const verify_signature = (event : PendingEvent, signer_address : address, signer_key : key, sig : signature ) : PendingEvent => {
+  const key_hash = match(Map.find_opt(signer_address, event.awaiting_signature), {
+    Some: hash => hash,
+    None: () => failwith("signature not required")
+  });
+
+  if (key_hash != Crypto.hash_key(signer_key)) { 
+    failwith ("invalid key")
+  };
+
+  if (! Crypto.check(signer_key, sig, event.message)) {
+    failwith(" invalid signature");
+  };
+
+  return { ...event,
+    awaiting_signature : Map.remove(signer_address, event.awaiting_signature),
+    already_signed : list([ [signer_address, key_hash, sig], ...event.already_signed])
+  };
+}
+
+// alert any contracts required to sign an event that their signature is required
+const alert_signers = (operations : list<operation>, event : EventRequest, signers : map<address, key_hash>) : list<operation> => {
+  const request_signature = ([operations, [signer,_]] : [list<operation>, [address, key_hash]]) => {
+    const contract = Option.unopt(Tezos.get_contract_opt(signer));
+    const transaction = Tezos.transaction(RequestSignature(event), 0 as tez, contract);
+    return list([transaction, ...operations]);
+  };
+  const operations = Map.fold(request_signature, signers, operations);
+
+  return operations;
+};
+
+// adds an extra signer, assumes that all verification steps have been completed 
+const add_signer = (storage : Storage, signing_address : address, signing_key) : Storage => {
+  return { ...storage, 
+     signers : Map.add(signing_address, signing_key, storage.signers)
+  };
+};
+
+const verify_signer = (confirmation : ConfirmSigner) : [address, key_hash] => {
+  const {authorisation_ticket, signing_key, signed_authorisation} = confirmation;
+  const [[ticketer, [authorisation,_]], _] = Tezos.read_ticket(authorisation_ticket);
+  let hashed_key = Crypto.hash_key(signing_key);
+  let signer = authorisation.signing_address;
+  if (ticketer != Tezos.get_self_address() || signer != Tezos.get_sender() || hashed_key != authorisation.signing_key_hash) {
+    failwith("bad authorisation ticket");
+  };
+  if (! Crypto.check(signing_key, signed_authorisation, authorisation.authorisation_message)) {
+    failwith(" invalid authorization signature");
+  };
+  return [signer, hashed_key];
+};
+
+
+/*************************
+ * Entry Point Functions *
+ *************************/
+
+const propose_signer = (storage : Storage, _ : OwnerAuthorisation, proposal : ProposeSigner) : EntryPointReturnType => {
+  const signing_address = proposal.signing_address;
+  const signing_contract : contract<CallbackParameter> = match(Tezos.get_contract_opt(signing_address), {
+    Some : (contract) => contract,
+    None : () => failwith("invalid signing contract")
+  });
+  const authorisation_ticket = Option.unopt(Tezos.create_ticket(proposal, 1 as nat));
+  const request_confirmation = Tezos.transaction(RequestConfirmation(authorisation_ticket), 0 as tez, signing_contract);
+  return [list([request_confirmation]), storage];
+};
+
+const confirm_signer = (storage : Storage, confirmation : ConfirmSigner) : Storage => {
+  const [signing_address, signing_key] = verify_signer(confirmation);
+  return add_signer(storage, signing_address, signing_key);
+};
+
+const remove_signer = (storage : Storage) : Storage => {
+  let signing_address = Tezos.get_sender();
+  return { ...storage, 
+     signers : Map.remove(signing_address, storage.signers)
+  };
+};
+
+const change_owner = (storage : Storage, _ : OwnerAuthorisation,  new_owner : address) : Storage => {
+  return { ...storage,
+  owner_address : new_owner
+  };
+};
+
+const propose_event = (storage : Storage, _ : OwnerAuthorisation, event : EventRequest) : EntryPointReturnType => {
+  const pending : PendingEvent = {
+    message : event.message,
+    awaiting_signature : storage.signers,
+    already_signed : list([])
+  };
+  let [operations, storage] = emit_or_update(storage, event.event_id, pending);
+  operations = alert_signers(operations, event, storage.signers);
+  return [operations, storage];
+};
+
+const sign_event = (storage : Storage, sig : SignEvent) : EntryPointReturnType => {
+  const event_to_sign = find_event(storage, sig.event_id);
+  const signer_address =  Tezos.get_sender();
+  const verified_event = verify_signature(event_to_sign, signer_address, sig.signing_key, sig.signature);
+  return emit_or_update(storage, sig.event_id, verified_event);
+};
+
+const abandon_event = (storage : Storage, _ : OwnerAuthorisation, id : string) : Storage => 
+  { ...storage, 
+     pending_events : Map.remove(id, storage.pending_events)
+  };
+
+const main = ([parameter, storage] : [EntrypointParameter, Storage]) => 
+match(parameter, {
+  ProposeSigner : (signer) => propose_signer(storage, abort_if_not_owner(storage), signer),
+  ConfirmSigner : (confirmation) => no_op (confirm_signer(storage, confirmation)),
+  RemoveSigner : () => no_op (remove_signer(storage)),
+  ChangeOwner : (new_owner) => no_op (change_owner(storage, abort_if_not_owner(storage), new_owner)),
+  ProposeEvent : (request) => propose_event(storage, abort_if_not_owner(storage), request),
+  SignEvent : (sig) => sign_event(storage, sig),
+  AbandonEvent : (id) => no_op (abandon_event(storage, abort_if_not_owner(storage), id))
+});
