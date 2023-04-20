@@ -43,31 +43,25 @@ type EventRequest = {
   message : bytes
 };
 
-// The owner can propose a new signer. To confirm the signer must send their public
-// signing key and sign a message to confirm they have the private key
+// The owner can propose a new signer. This soesn't add a signer until the signer confirms the key
 type ProposeSigner = {
   signing_address : address,
   authorisation_message : bytes,
   signing_key_hash : key_hash
 };
 
-// This is the entry point required by the signing contracts
-// in reality they would be more complex
-type CallbackParameter = 
-| ["RequestSignature", EventRequest]
-| ["RequestConfirmation", ticket<ProposeSigner>]
-
-
-type SignEvent = {
-  event_id : string,
-  signing_key : key,
-  signature : signature
-};
-
+// the new signer then confirms by providing the full key and signing the authorisation message
 type ConfirmSigner = {
   authorisation_ticket : ticket<ProposeSigner>,
   signing_key : key,
   signed_authorisation : signature,
+};
+
+// To sign an event the signers provide their public key and sign the event message
+type SignEvent = {
+  event_id : string,
+  signing_key : key,
+  signature : signature
 };
 
 type EntrypointParameter =
@@ -136,6 +130,7 @@ const find_event = (storage : Storage, id : string) : PendingEvent =>
 
 // validates a signature and updates a pending event
 const verify_signature = (event : PendingEvent, signer_address : address, signer_key : key, sig : signature ) : PendingEvent => {
+
   const key_hash = match(Map.find_opt(signer_address, event.awaiting_signature), {
     Some: hash => hash,
     None: () => failwith("signature not required")
@@ -157,9 +152,9 @@ const verify_signature = (event : PendingEvent, signer_address : address, signer
 
 // alert any contracts required to sign an event that their signature is required
 const alert_signers = (operations : list<operation>, event : EventRequest, signers : map<address, key_hash>) : list<operation> => {
-  const request_signature = ([operations, [signer,_]] : [list<operation>, [address, key_hash]]) => {
-    const contract = Option.unopt(Tezos.get_contract_opt(signer));
-    const transaction = Tezos.transaction(RequestSignature(event), 0 as tez, contract);
+  const request_signature = ([operations, [signing_address,_]] : [list<operation>, [address, key_hash]]) => {
+    const contract = Option.unopt(Tezos.get_entrypoint_opt("%RequestSignature", signing_address));
+    const transaction = Tezos.transaction(event, 0 as tez, contract);
     return list([transaction, ...operations]);
   };
   const operations = Map.fold(request_signature, signers, operations);
@@ -195,12 +190,17 @@ const verify_signer = (confirmation : ConfirmSigner) : [address, key_hash] => {
 
 const propose_signer = (storage : Storage, _ : OwnerAuthorisation, proposal : ProposeSigner) : EntryPointReturnType => {
   const signing_address = proposal.signing_address;
-  const signing_contract : contract<CallbackParameter> = match(Tezos.get_contract_opt(signing_address), {
+  const signing_contract = match(Tezos.get_entrypoint_opt("%RequestConfirmation", signing_address), {
+    Some : (contract) => contract,
+    None : () => failwith("invalid signing contract")
+  });
+  // confirm that the contract also has the correct entrypoint to request a signature
+  const _ : contract<EventRequest> = match(Tezos.get_entrypoint_opt("%RequestSignature", signing_address), {
     Some : (contract) => contract,
     None : () => failwith("invalid signing contract")
   });
   const authorisation_ticket = Option.unopt(Tezos.create_ticket(proposal, 1 as nat));
-  const request_confirmation = Tezos.transaction(RequestConfirmation(authorisation_ticket), 0 as tez, signing_contract);
+  const request_confirmation = Tezos.transaction(authorisation_ticket, 0 as tez, signing_contract);
   return [list([request_confirmation]), storage];
 };
 
