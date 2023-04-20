@@ -1,6 +1,6 @@
 # TZIP-contracts
 
-This is a holding repository for smart contract examples for TZIP's. Feel free to arganise it a bit better when there's more than one file in it.
+This is a holding repository for smart contract examples for TZIP's. Feel free to organise it a bit better when there's more than one file in it.
 
 ## Contents
 
