@@ -1,4 +1,4 @@
-{ parameter (pair (string %challenge_id) (string %payload)) ;
+{ parameter (pair %proof_of_event_challenge (string %challenge_id) (string %payload)) ;
   storage unit ;
   code { UNPAIR ;
          SWAP ;
