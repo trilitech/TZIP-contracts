@@ -1,0 +1,10 @@
+{ parameter (pair %proof_of_event_challenge (string %challenge_id) (string %payload)) ;
+  storage unit ;
+  code { UNPAIR ;
+         SWAP ;
+         NIL operation ;
+         DIG 2 ;
+         EMIT %proof_of_event (pair (string %challenge_id) (string %payload)) ;
+         CONS ;
+         PAIR } }
+

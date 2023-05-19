@@ -1,0 +1,31 @@
+type Event = {
+  challenge_id : string,
+  payload : string,
+};
+
+type Parameter =
+| ["Proof_of_event_challenge", Event];
+
+/*
+const emit_or_update = (storage, id : string, event : PendingEvent) : EntryPointReturnType => {
+  if (Map.size(event.awaiting_signature) == (0 as nat)) {
+    const emit_event : Event = {
+        challenge_id : id,
+        payload : event.payload,
+    };
+    const updated_storage : Storage = { ...storage,
+      pending_events : Map.remove(id, storage.pending_events)
+    };
+    return [list([ Tezos.emit("%proof_of_event", emit_event)]), updated_storage]
+  } else {
+    const updated_storage : Storage = { ...storage,
+      pending_events : Map.add(id, event, storage.pending_events)
+    };
+    return no_op(updated_storage);
+  }
+};
+*/
+const main = ([parameter, storage] : [Parameter, unit]) => 
+match(parameter, {
+  Proof_of_event_challenge : (challenge) => [list([ Tezos.emit("%proof_of_event", challenge)]), storage]
+});
